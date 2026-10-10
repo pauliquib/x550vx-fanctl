@@ -1,0 +1,16 @@
+[Unit]
+Description=ASUS X550VX fan control (EC/SFNV curve daemon)
+Documentation=file:/usr/local/share/doc/x550vx-fanctl/README.md
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/x550vx-fanctl daemon
+# always hand control back to the EC when the service stops
+ExecStopPost=/usr/local/sbin/x550vx-fanctl auto
+Restart=on-failure
+RestartSec=5
+Nice=-1
+
+[Install]
+WantedBy=multi-user.target

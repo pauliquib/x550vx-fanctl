@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# x550vx-fanctl — configurable fan control for ASUS X550VX (and EC-compatible X55x)
+#
+# Uses the ACPI EC method SFNV (decompiled from the X550VX DSDT):
+#
+#   SFNV(Arg0, Arg1)
+#     Arg0 = 0 → automatic: EC[0x0521]/EC[0x0522] |= 0x80 (auto flag per fan)
+#     Arg0 = 1 → fan1 manual: EC[0x0521] &= 0x7F, ST84(0, Arg1) = raw speed
+#     Arg0 = 2 → fan2 manual: EC[0x0522] &= 0x7F, ST84(1, Arg1) = raw speed
+#   TACH(Arg0) → real RPM of fan Arg0 (0 = fan1, 1 = fan2/GPU fan if present)
+#   RRAM/WRAM(addr[, value]) → raw EC RAM access (16-bit address space)
+#
+# Manual mode persists until something calls SFNV 0 (e.g. a thermal event or
+# suspend/resume) — the daemon therefore re-asserts the chosen speed every
+# KEEPALIVE_INTERVAL seconds.
+#
+# Requires: acpi_call kernel module (/proc/acpi/call).
+
+set -uo pipefail
+
+PROG="${0##*/}"
+ACPI=/proc/acpi/call
+CONF=/etc/x550vx-fanctl.conf
+LOCK=/run/x550vx-fanctl.lock
+VERSION=1.0.0
+
+# ---- defaults (overridden by $CONF) ---------------------------------------
+POLL_INTERVAL=2            # seconds between temp checks
+FANS="1"                   # fans to manage: "1", "2" or "1 2"
+FAN_OFF_TEMP=45            # °C — at/below this the curve yields speed 0
+CRIT_TEMP=90               # °C — emergency: restore auto and exit(2)
+MIN_SPEED_DELTA=10         # raw units — ignore smaller speed changes (jitter)
+KEEPALIVE_INTERVAL=30      # seconds — re-assert manual speed (0 = disabled)
+RESTORE_AUTO_ON_EXIT=yes   # daemon returns fan to auto on stop/signal
+CURVE_TEMPS=(45 60 70 80)  # °C, strictly ascending
+CURVE_SPEEDS=(0 80 160 255) # EC raw speed units, same count as CURVE_TEMPS
+QUIET=no                   # daemon logging
+# ----------------------------------------------------------------------------
+
+log() { [[ "$QUIET" == "yes" ]] || printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# acpi_call passthrough: call 'METHOD args' → prints result (stripped of NULs)
+call() {
+  [[ -w "$ACPI" ]] || return 1   # root-only file — fail quietly, not noisily
+  echo "$1" > "$ACPI" 2>/dev/null || return 1
+  tr -d '\0' < "$ACPI" 2>/dev/null
+}
+
+need_acpi() {
+  [[ -e "$ACPI" ]] || modprobe acpi_call 2>/dev/null || true
+  [[ -e "$ACPI" ]] || die "$ACPI not available — load acpi_call (apt install acpi-call-dkms + linux-headers)"
+}
+
+need_root() {
+  (( EUID == 0 )) || die "must run as root (sudo $PROG $*)"
+}
+
+# decimal parser for acpi_call results ("0x1a", raw bytes, or decimal text)
+acpi_int() {
+  local s
+  s=$(tr -d '\0' <<< "${1:-}")
+  if [[ "$s" =~ ^0[xX][0-9a-fA-F]+$ ]]; then printf '%d' "$s"
+  else tr -dc '0-9' <<< "$s"; fi
+}
+
+read_temp() { # → °C integer (highest of coretemp package / EC temp1)
+  local best=0 t h
+  for h in /sys/class/hwmon/hwmon*/; do
+    [[ -r "$h/name" ]] || continue
+    case "$(cat "$h/name" 2>/dev/null)" in
+      coretemp|k10temp|zenpower)
+        t=$(( $(cat "$h/temp1_input" 2>/dev/null || echo 0) / 1000 ))
+        (( t > best )) && best=$t ;;
+    esac
+  done
+  if (( best == 0 )); then
+    for f in /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/temp1_input; do
+      [[ -r "$f" ]] || continue
+      t=$(( $(cat "$f" 2>/dev/null || echo 0) / 1000 ))
+      (( t > best )) && best=$t
+    done
+  fi
+  echo "$best"
+}
+
+read_rpm() { # $1 = fan index (0=fan1, 1=fan2) → RPM via TACH
+  local out n
+  out=$(call "\\_SB.PCI0.LPCB.EC0.TACH $1") || { echo "?"; return; }
+  n=$(acpi_int "$out")
+  echo "${n:-?}"
+}
+
+read_mode() { # prints "auto"/"manual"/"?" from EC[0x0521] bit7
+  local out v
+  out=$(call "\\_SB.PCI0.LPCB.EC0.RRAM 1313") || { echo "?"; return; }  # 0x0521
+  v=$(acpi_int "$out")
+  [[ -n "$v" ]] || { echo "?"; return; }
+  (( (v & 0x80) != 0 )) && echo "auto" || echo "manual"
+}
+
+set_speed() { # $1 = raw speed 0-255 → SFNV <fan> <v> for every fan in $FANS
+  local f v="$1" rc=0
+  for f in $FANS; do
+    call "\\_SB.PCI0.LPCB.EC0.SFNV $f $v" >/dev/null || rc=1
+  done
+  return $rc
+}
+
+set_auto() {
+  call '\_SB.PCI0.LPCB.EC0.SFNV 0 0' >/dev/null
+  local p
+  for p in /sys/devices/platform/asus-nb-wmi/hwmon/hwmon*/pwm1_enable; do
+    [[ -w "$p" ]] && echo 2 > "$p" 2>/dev/null || true
+  done
+}
+
+# piecewise-linear curve: temp → raw speed
+speed_for_temp() {
+  local t="$1" n=${#CURVE_TEMPS[@]} i lo_t lo_s hi_t hi_s
+  (( n == 0 )) && { echo 0; return; }
+  (( t <= CURVE_TEMPS[0] )) && { echo "${CURVE_SPEEDS[0]}"; return; }
+  (( t >= CURVE_TEMPS[n-1] )) && { echo "${CURVE_SPEEDS[n-1]}"; return; }
+  for (( i = 1; i < n; i++ )); do
+    if (( t <= CURVE_TEMPS[i] )); then
+      lo_t=${CURVE_TEMPS[i-1]}; lo_s=${CURVE_SPEEDS[i-1]}
+      hi_t=${CURVE_TEMPS[i]};   hi_s=${CURVE_SPEEDS[i]}
+      echo $(( lo_s + (t - lo_t) * (hi_s - lo_s) / (hi_t - lo_t) ))
+      return
+    fi
+  done
+}
+
+validate_config() {
+  (( ${#CURVE_TEMPS[@]} == ${#CURVE_SPEEDS[@]} )) \
+    || die "config: CURVE_TEMPS and CURVE_SPEEDS must have equal length"
+  local i
+  for (( i = 1; i < ${#CURVE_TEMPS[@]}; i++ )); do
+    (( CURVE_TEMPS[i] > CURVE_TEMPS[i-1] )) \
+      || die "config: CURVE_TEMPS must be strictly ascending"
+  done
+}
+
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+  need_acpi
+  local t rpm1 rpm2 mode
+  t=$(read_temp); rpm1=$(read_rpm 0); rpm2=$(read_rpm 1); mode=$(read_mode)
+  cat <<EOF
+$PROG $VERSION — status
+  acpi_call:  $ACPI OK
+  mode:       $mode   (EC[0x0521] bit7: 1=auto, 0=manual)
+  temp:       ${t} °C
+  fan1 RPM:   $rpm1   (TACH 0)
+  fan2 RPM:   $rpm2   (TACH 1 — X550VX has a single fan; expect 0/?)
+  config:     $CONF ($([[ -r $CONF ]] && echo loaded || echo defaults))
+  daemon:     $(pgrep -f "$PROG daemon" >/dev/null && echo RUNNING || echo not running)
+EOF
+  (( EUID == 0 )) || echo "  note: run as root for EC readings (RPM/mode)"
+}
+
+cmd_set() {
+  need_root; need_acpi
+  local v="${1:?usage: $PROG set <0-255>}"
+  [[ "$v" =~ ^[0-9]+$ ]] && (( v <= 255 )) || die "speed must be 0-255"
+  set_speed "$v" || die "SFNV write failed"
+  log "manual speed $v → fans [$FANS]  (SFNV $v)"
+  echo "speed=$v (manual). Restore auto: $PROG auto"
+}
+
+cmd_off() {
+  need_root; need_acpi
+  set_speed 0 || die "SFNV write failed"
+  echo "fan(s) stopped (manual mode, speed 0). Restore: $PROG auto"
+}
+
+cmd_auto() {
+  need_root; need_acpi
+  set_auto || die "SFNV write failed"
+  echo "fan control returned to automatic (SFNV 0)."
+}
+
+cmd_ec() {
+  need_root; need_acpi
+  [[ $# -ge 1 ]] || die "usage: $PROG ec <METHOD> [args…]  e.g. $PROG ec TACH 0"
+  local cmd="\\_SB.PCI0.LPCB.EC0.$*"
+  echo ">>> $cmd"
+  call "$cmd"; echo
+}
+
+cmd_daemon() {
+  need_root; need_acpi
+  validate_config
+  exec 9>"$LOCK"
+  flock -n 9 || die "another daemon instance is already running"
+  log "start: curve temps[${CURVE_TEMPS[*]}] speeds[${CURVE_SPEEDS[*]}] poll=${POLL_INTERVAL}s fans=[$FANS]"
+  trap 'log "exit → auto"; [[ "$RESTORE_AUTO_ON_EXIT" == "yes" ]] && set_auto; exit 0' TERM INT
+
+  local t speed last_speed=-1 last_write=-1 now d need
+  while :; do
+    t=$(read_temp)
+    now=$SECONDS
+    if (( t >= CRIT_TEMP )); then
+      log "!! ${t}°C >= CRIT_TEMP ${CRIT_TEMP}°C — restoring AUTO"
+      set_auto
+      exit 2
+    fi
+    speed=$(speed_for_temp "$t")
+    need=0
+    (( last_speed < 0 )) && need=1
+    d=$(( speed - last_speed )); (( d < 0 )) && d=$(( -d ))
+    (( d >= MIN_SPEED_DELTA )) && need=1
+    { (( speed == 0 )) || (( last_speed == 0 )); } && (( speed != last_speed )) && need=1
+    (( KEEPALIVE_INTERVAL > 0 && now - last_write >= KEEPALIVE_INTERVAL )) && need=1
+    if (( need )); then
+      set_speed "$speed" || log "SFNV write failed"
+      log "T=${t}°C → speed $speed (fans: $FANS)"
+      last_speed=$speed; last_write=$now
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+usage() {
+  cat <<EOF
+$PROG $VERSION — fan control for ASUS X550VX (EC/SFNV via acpi_call)
+
+Usage: $PROG <command> [args]
+
+  status                  temp, RPM (TACH) and manual/auto state
+  set <0-255>             manual fan speed (raw EC units; 0 = off)
+  off                     stop the fan completely (SFNV 1 0)
+  auto                    return to automatic EC control (SFNV 0 0)
+  daemon                  run the temperature-curve loop (foreground)
+  ec <METHOD> [args…]     raw EC method call, e.g. '$PROG ec TACH 0'
+  help                    this text
+
+Config:  $CONF (see comments inside)
+Daemon:  systemd unit x550vx-fanctl.service runs '$PROG daemon'
+Safety:  at CRIT_TEMP the daemon restores automatic control and exits.
+         Manual mode resets to auto after reboot/suspend (firmware behaviour).
+EOF
+}
+
+main() {
+  [[ -r "$CONF" ]] && . "$CONF"
+  local c="${1:-help}"; shift || true
+  case "$c" in
+    status)            cmd_status ;;
+    set)               cmd_set "$@" ;;
+    off)               cmd_off ;;
+    auto)              cmd_auto ;;
+    daemon|curve|run)  cmd_daemon ;;
+    ec|call)           cmd_ec "$@" ;;
+    help|-h|--help)    usage ;;
+    version|-V|--version) echo "$PROG $VERSION" ;;
+    *) die "unknown command '$c' — see '$PROG help'" ;;
+  esac
+}
+main "$@"
