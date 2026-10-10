@@ -27,7 +27,6 @@ VERSION=1.0.0
 # ---- defaults (overridden by $CONF) ---------------------------------------
 POLL_INTERVAL=2            # seconds between temp checks
 FANS="1"                   # fans to manage: "1", "2" or "1 2"
-FAN_OFF_TEMP=45            # °C — at/below this the curve yields speed 0
 CRIT_TEMP=90               # °C — emergency: restore auto and exit(2)
 MIN_SPEED_DELTA=10         # raw units — ignore smaller speed changes (jitter)
 KEEPALIVE_INTERVAL=30      # seconds — re-assert manual speed (0 = disabled)
