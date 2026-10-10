@@ -33,9 +33,15 @@ not exist. `SFNV` is the way in.
 - `acpi_call` kernel module: `apt install acpi-call-dkms linux-headers-$(uname -r)`
 - root (all EC writes)
 
+> **Tested on:** ASUS X550VX, BIOS X550VX.305, Debian 13 (kernel 6.12).
+> Other models with the same EC methods may work — verify with `status`
+> and the `ec` passthrough before relying on `set`/`off`.
+
 ## Install
 
 ```bash
+git clone https://github.com/pauliquib/x550vx-fanctl.git
+cd x550vx-fanctl
 sudo ./install.sh        # installs script, config, systemd unit; loads acpi_call
 ```
 
@@ -121,4 +127,4 @@ mapping to RPM for your unit, please contribute the numbers back.
 
 ## License
 
-Unreleased / private work-in-progress — decide before publishing.
+GPL-3.0 — see [LICENSE](LICENSE).
